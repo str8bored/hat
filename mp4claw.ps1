@@ -519,20 +519,64 @@ function Invoke-Download([object]$Info, [string]$OutPath) {
 }
 
 function Resolve-Video([string]$Link) {
-    $vid = Get-YouTubeVideoId $Link
-    if ($vid) {
-        Write-Status 'YouTube link detected, i just knew it...'
+    # YouTube
+    if ($Link -match '(?:youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([^?&/]+)') {
+        $vid = $Matches[1]
+        Write-Status "YouTube link detected: $vid"
         $watch = "https://www.youtube.com/watch?v=$vid"
         $yt = Get-YouTubeFromPage -VideoId $vid -WatchUrl $watch
-        if (-not $yt) { throw 'YouTube: could not get a playable MP4 URL (video may be restricted or region-locked).' }
+        if (-not $yt) { throw "YouTube: could not get a playable MP4 URL (video may be restricted or region-locked)." }
         return Resolve-YouTube $yt $vid
     }
 
-    Write-Status 'let me see the page...'
+    # Vimeo
+    if ($Link -match 'vimeo\.com/(?:channels/[^/]+/)?videos/(\d+)') {
+        $vid = $Matches[1]
+        Write-Status "Vimeo link detected: $vid"
+        try {
+            $json = Invoke-WebRequest -Uri "https://vimeo.com/api/oembed.json?url=https://vimeo.com/$vid" -Method Post -Body '{"url":"https://vimeo.com/$vid"}' -ContentType 'application/json' -TimeoutSec 30 | ConvertFrom-Json
+        } catch {
+            throw "Vimeo API request failed: $($_.Exception.Message)"
+        }
+        if (-not $json -or -not $json.video) { throw "Vimeo: could not retrieve video data." }
+        $videoUrl = $json.video
+        if ($videoUrl -match 'vimeo\.com/proxy/file/([a-zA-Z0-9]+)\.(mp4|webm)') {
+            $streamId = $Matches[1]
+            $ext = $Matches[2]
+            $streamUrl = "https://player.vimeo.com/external/$streamId.$ext"
+            Write-Status "Vimeo stream URL: $streamUrl"
+            return @{
+                Merge  = $false
+                Mp4Url = $streamUrl
+                Title  = $json.title
+                Referer = $Link
+                Ua     = $UserAgent
+            }
+        }
+        throw "Vimeo: could not find direct MP4 stream. Video URL: $($json.video)"
+    }
+
+    # Direct .mp4 URL
+    if ($Link -match '\.mp4($|[?&])') {
+        Write-Status "Direct MP4 URL detected"
+        return @{
+            Merge  = $false
+            Mp4Url = $Link
+            Title  = Get-PageTitle $Link
+            Referer = $Link
+            Ua     = $UserAgent
+        }
+    }
+
+    # Generic HTML page — scrape for .mp4 URLs
+    Write-Status "Generic page detected, scraping for .mp4 links..."
     $html = Invoke-WebText -Url $Link
     $urls = Find-Mp4UrlsInText -Text $html -PageUrl $Link
-    if ($urls.Count -eq 0) { throw 'No .mp4 URL found in page HTML or embedded data.' }
+    if ($urls.Count -eq 0) {
+        throw "No .mp4 URL found in page HTML. Try pasting a direct .mp4 link or a supported video site URL."
+    }
 
+    # Score and pick best candidate
     $scored = foreach ($u in $urls) {
         $score = 0
         if ($u -match '(?:^|[/?&])(2160|4k)(?:[p_/-]|$)') { $score = 2160 }
