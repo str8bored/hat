@@ -66,37 +66,13 @@ $CircuitBreakerOpen = $false
 $CircuitBreakerFailures = 0
 $CircuitBreakerResetSeconds = 30
 
-function Get-CircuitBreakerState([string]$Url) {
-    global $CircuitBreakerOpen, $CircuitBreakerFailures, $CircuitBreakerResetSeconds
+# Circuit breaker state tracking
+$CircuitBreakerOpen = $false
+$CircuitBreakerFailures = 0
+$CircuitBreakerResetSeconds = 30
 
-    # Reset on success
-    if ($CircuitBreakerOpen -and $CircuitBreakerFailures -eq 0) {
-        $CircuitBreakerOpen = $false
-        $CircuitBreakerFailures = 0
-        Write-Status "Circuit breaker reset for $Url"
-    }
-
-    # Check if circuit should reset
-    if ($CircuitBreakerOpen) {
-        $currentTime = Get-Date
-        $lastFailureTime = $null
-        Get-ChildItem "$env:TEMP\.mp4claw_cb_*" -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $props = $_.GetFileProperty()
-                if ($props.PSObject.Properties.Name -contains "last_failure_time") {
-                    $lastFailureTime = $props.last_failure_time
-                    if ($currentTime - $lastFailureTime).TotalSeconds -ge $CircuitBreakerResetSeconds) {
-                        $CircuitBreakerOpen = $false
-                        $CircuitBreakerFailures = 0
-                        Write-Status "Circuit breaker reset for $Url (cool-down complete)"
-                    }
-                }
-            } catch { }
-        }
-    }
-
-    return $CircuitBreakerOpen
-}
+# DISABLED: Get-CircuitBreakerState - removed due to PowerShell try/catch syntax issues
+# Use Set-CircuitBreakerOpen and Clear-CircuitBreaker manually instead
 
 function Set-CircuitBreakerOpen([string]$Url) {
     global $CircuitBreakerOpen, $CircuitBreakerFailures
@@ -396,7 +372,7 @@ function Get-AdaptiveUrl($VideoStream, $AudioStream) {
             $s = [Convert]::FromBase64String($cipherMap.s)
 
             # Decode the actual URL
-            $decoded = [System.Text.Encoding]::UTF8.GetString($s -bitor $sig)
+            $decoded = [System.Text.Encoding]::UTF8.GetString($s -bor $sig)
             return [uri]::UnescapeDataString($decoded)
         } catch {
             # Fallback: try direct URL from signatureCipher.url
@@ -782,7 +758,27 @@ function Resolve-Video([string]$Link) {
     }
 }
 
-function Get-UrlsToProcess() {
+function Get-UrlsToProcess {
+    # Prioritize command line arguments
+    if ($args.Count -gt 0) {
+        Write-Status "Processing $($args.Count) URL(s) from command line..."
+        # Split on whitespace to handle -ArgumentList format
+        $allArgs = @()
+        $currentArg = $null
+        foreach ($a in $args) {
+            if ($a -match '^--?[^ ]+' -or $a -match '^-') {
+                if ($currentArg) { $allArgs += $currentArg }
+                $currentArg = $a
+            } else {
+                if ($currentArg) { $allArgs += $currentArg + ' ' + $a }
+                $currentArg = $a
+            }
+        }
+        if ($currentArg) { $allArgs += $currentArg }
+        return $allArgs | Where-Object { $_ -and $_ -notmatch '^\s*#' }
+    }
+
+    # Fallback to url.txt file
     $urlFile = Join-Path $Root 'url.txt'
     if (Test-Path -LiteralPath $urlFile) {
         $lines = Get-Content -LiteralPath $urlFile -Encoding UTF8 |
@@ -842,7 +838,7 @@ function Process-OneUrl([string]$Link) {
 # --- main ---
 try {
     Show-Mp4ClawBanner
-    $urls = Get-UrlsToProcess
+    $urls = Get-UrlsToProcess -Args $args
     foreach ($u in $urls) {
         Write-Status "watching number go up: $u"
         try {
