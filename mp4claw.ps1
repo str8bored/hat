@@ -254,6 +254,114 @@ function Select-BestYouTubeMuxed($PlayerJson) {
     return $candidates | Sort-Object Height, Bitrate, ContentLength -Descending | Select-Object -First 1
 }
 
+function Select-BestAdaptiveStream($PlayerJson) {
+    # Try to find a muxed stream first (video+audio combined)
+    $muxed = Select-BestYouTubeMuxed $PlayerJson
+    if ($muxed) {
+        return $muxed
+    }
+
+    # No muxed stream found — try adaptive (separate video+audio)
+    Write-Status "No muxed stream found. Searching for adaptive video+audio..."
+    
+    # Get best video-only stream
+    $video = Select-BestYouTubeVideo $PlayerJson
+    if (-not $video) {
+        Write-Status "No video stream available."
+        return $null
+    }
+
+    # Get best audio stream
+    $audio = Select-BestYouTubeAudio $PlayerJson
+    if (-not $audio) {
+        Write-Status "No audio stream available. Video-only stream selected."
+        return $video
+    }
+
+    # Build adaptive stream info
+    return @{
+        Merge     = $true
+        VideoUrl  = $video.Url
+        AudioUrl  = $audio.Url
+        Title     = $video.QualityLabel
+        Height    = $video.Height
+        Width     = $video.Width
+        Bitrate   = $video.Bitrate
+        ContentLength = $video.ContentLength
+    }
+}
+
+function Get-AdaptiveUrl($VideoStream, $AudioStream) {
+    # Try signatureCipher method first
+    $videoCipher = $VideoStream.signatureCipher
+    $audioCipher = $AudioStream.signatureCipher
+
+    if ($videoCipher -and $videoCipher -ne $null) {
+        $cipherParams = $videoCipher -split '&'
+        $cipherMap = @{}
+        foreach ($pair in $cipherParams) {
+            if ($pair -match '^([^=]+)=(.*)$') {
+                $cipherMap[$Matches[1]] = [uri]::UnescapeDataString($Matches[2])
+            }
+        }
+
+        # Decode the signature
+        try {
+            $cipherText = [uri]::UnescapeDataString($cipherMap.sig)
+            $sig = [Convert]::FromBase64String($cipherText)
+            $s = [Convert]::FromBase64String($cipherMap.s)
+
+            # Decode the actual URL
+            $decoded = [System.Text.Encoding]::UTF8.GetString($s -bitor $sig)
+            return [uri]::UnescapeDataString($decoded)
+        } catch {
+            # Fallback: try direct URL from signatureCipher.url
+            if ($cipherMap.url) {
+                return [uri]::UnescapeDataString($cipherMap.url)
+            }
+        }
+    }
+
+    # Fallback: use the URL directly (some streams work without signature)
+    return $VideoStream.url
+}
+function Select-BestYouTubeAudio($PlayerJson) {
+    $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
+        $u = Get-FormatDirectUrl $s
+        if (-not $u) { continue }
+        if ($s.mimeType -notmatch 'audio/(mp4|mpeg)') { continue }
+        $m = Get-StreamMetrics $s
+        [pscustomobject]@{
+            Url           = $u
+            Mime          = $s.mimeType
+            Bitrate       = $m.Bitrate
+            ContentLength = $m.ContentLength
+            QualityLabel  = $m.QualityLabel
+        }
+    }
+    if (-not $candidates) { return $null }
+    return $candidates | Sort-Object Bitrate, ContentLength -Descending | Select-Object -First 1
+}
+
+function Select-BestYouTubeMuxed($PlayerJson) {
+    $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
+        $u = Get-FormatDirectUrl $s
+        if (-not $u) { continue }
+        if ($s.mimeType -notmatch 'video/mp4') { continue }
+        $m = Get-StreamMetrics $s
+        if (-not $m.HasAudio) { continue }
+        [pscustomobject]@{
+            Url           = $u
+            Height        = $m.Height
+            Bitrate       = $m.Bitrate
+            ContentLength = $m.ContentLength
+            QualityLabel  = $m.QualityLabel
+        }
+    }
+    if (-not $candidates) { return $null }
+    return $candidates | Sort-Object Height, Bitrate, ContentLength -Descending | Select-Object -First 1
+}
+
 function Invoke-YouTubePlayer([string]$VideoId, [string]$ApiKey) {
     $endpoint = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
     foreach ($client in (Get-InnertubeClients)) {
@@ -386,56 +494,42 @@ function New-YouTubeInfo([hashtable]$Fields, [object]$Yt, [string]$VideoId) {
 
 function Resolve-YouTube([object]$Yt, [string]$VideoId) {
     $ffmpeg = Get-FfmpegPath
-    $audio = Select-BestYouTubeAudio $Yt.Json
     $video = $Yt.Video
+    $audio = Select-BestYouTubeAudio $Yt.Json
 
-    if ($ffmpeg -and $audio -and -not $video.HasAudio) {
-        $label = if ($video.QualityLabel) { $video.QualityLabel } else { "$($video.Height)p" }
-        Write-Status "crispy video: $label + separate audio (ffmpeg merge)"
-        return (New-YouTubeInfo @{
-            Merge    = $true
-            VideoUrl = $video.Url
-            AudioUrl = $audio.Url
-        } $Yt $VideoId)
-    }
-
-    if ($ffmpeg -and $audio -and $video.HasAudio) {
+    # Strategy 1: Try muxed stream (video+audio combined in single MP4)
+    if ($ffmpeg -and $audio) {
         $muxed = Select-BestYouTubeMuxed $Yt.Json
-        if ($muxed -and $video.Height -gt $muxed.Height) {
-            $label = if ($video.QualityLabel) { $video.QualityLabel } else { "$($video.Height)p" }
-            Write-Status "crispy video: $label + separate audio (ffmpeg merge)"
+        if ($muxed) {
+            Write-Status "muxed stream found: $($muxed.QualityLabel)"
             return (New-YouTubeInfo @{
-                Merge    = $true
-                VideoUrl = $video.Url
-                AudioUrl = $audio.Url
+                Merge  = $false
+                Mp4Url = $muxed.Url
             } $Yt $VideoId)
         }
     }
 
-    if ($video.HasAudio) {
+    # Strategy 2: Adaptive stream (separate video + audio, merge with ffmpeg)
+    if ($ffmpeg -and $video -and $audio) {
+        Write-Status "adaptive stream found: $($video.QualityLabel) + audio (ffmpeg merge)"
+        return (New-YouTubeInfo @{
+            Merge     = $true
+            VideoUrl  = $video.Url
+            AudioUrl  = $audio.Url
+        } $Yt $VideoId)
+    }
+
+    # Strategy 3: Video-only stream (no audio available)
+    if ($video) {
+        Write-Status "video-only stream: $($video.QualityLabel) (no audio available)"
         return (New-YouTubeInfo @{
             Merge  = $false
             Mp4Url = $video.Url
         } $Yt $VideoId)
     }
 
-    $muxed = Select-BestYouTubeMuxed $Yt.Json
-    if ($muxed) {
-        Write-Status "Using best muxed stream ($($muxed.QualityLabel))"
-        return (New-YouTubeInfo @{
-            Merge  = $false
-            Mp4Url = $muxed.Url
-        } $Yt $VideoId)
-    }
-
-    Write-Status 'Note: only a video-only stream was available; file may have no sound.'
-    return (New-YouTubeInfo @{
-        Merge  = $false
-        Mp4Url = $video.Url
-    } $Yt $VideoId)
-}
-
-function Test-IsHttp403([object]$Err) {
+    throw "YouTube: could not find any playable stream for video $VideoId"
+}function Test-IsHttp403([object]$Err) {
     $ex = $Err.Exception
     while ($ex) {
         if ($ex -is [System.Net.WebException] -and $ex.Response) {
@@ -634,10 +728,31 @@ function Process-OneUrl([string]$Link) {
     Write-Status 'jackpot...mp4 just found there downloading to root dir type shit'
     Write-Status "  $(Split-Path -Leaf $outPath)"
 
-    Invoke-Download -Info $info -OutPath $outPath
+    $maxRetries = 3
+    $baseDelay = 2  # seconds
 
-    Write-Status 'Mission Accomplished.'
-    Write-Status 'Deleting Shaders...'
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            Write-Status "Attempt $attempt / $maxRetries"
+            Invoke-Download -Info $info -OutPath $outPath
+            Write-Status 'Mission Accomplished.'
+            Write-Status 'Deleting Shaders...'
+            return
+        } catch {
+            $msg = $_.Exception.Message
+            if ($msg -notmatch '403|Forbidden|connection.*reset|timeout|timed out|request.*failed') {
+                throw
+            }
+
+            if ($attempt -lt $maxRetries) {
+                $delay = [math]::Round($baseDelay * ([math]::Pow(2, $attempt - 1)), 0)
+                Write-Status "Failed: $msg. Retrying in $delay seconds..."
+                Start-Sleep -Seconds $delay
+            } else {
+                Write-Status "All $maxRetries attempts failed. Last error: $msg"
+            }
+        }
+    }
 }
 
 # --- main ---
