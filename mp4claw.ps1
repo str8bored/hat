@@ -10,7 +10,7 @@ function Show-Mp4ClawBanner {
  _____ ______   ________  ___   ___  ________  ___       ________  ___       __      
 |\   _ \  _   \|\   __  \|\  \ |\  \|\   ____\|\  \     |\   __  \|\  \     |\  \    
 \ \  \\\__\ \  \ \  \|\  \ \  \\_\  \ \  \___|\ \  \    \ \  \|\  \ \  \    \ \  \   
- \ \  \\|__| \  \ \   ____\ \______  \ \  \    \ \  \    \ \   __  \ \  \  __\ \  \  1.0.0.0.0.0.0.0.0.005
+ \ \  \\|__| \  \ \   ____\ \______  \ \  \    \ \  \    \ \   __  \ \  \  __\ \  \  1.0.1
   \ \  \    \ \  \ \  \___|\|_____|\  \ \  \____\ \  \____\ \  \ \  \ \  \|\__\_\  \ 
    \ \__\    \ \__\ \__\          \ \__\ \_______\ \_______\ \__\ \__\ \____________\
     \|__|     \|__|\|__|           \|__|\|_______|\|_______|\|__|\|__|\|____________|
@@ -35,6 +35,66 @@ function Get-UniquePath([string]$Dir, [string]$BaseName) {
         if (-not (Test-Path -LiteralPath $path)) { return $path }
     }
     return Join-Path $Dir ($BaseName + " $(Get-Date -Format 'yyyyMMddHHmmss').mp4")
+}
+
+function Get-ErrorCategory([string]$Message) {
+    if ($Message -match '403|Forbidden') { return 'Forbidden' }
+    if ($Message -match 'timeout|timed out|operation.*timed out') { return 'Timeout' }
+    if ($Message -match 'connection.*reset|connection.*refused|connection.*closed') { return 'ConnectionReset' }
+    if ($Message -match 'DNS|DNS lookup|could not resolve') { return 'DNS' }
+    if ($Message -match 'SSL|certificate|ssl') { return 'SSL' }
+    if ($Message -match 'request.*failed|failed to connect') { return 'ConnectionFailed' }
+    if ($Message -match '404|Not Found') { return 'NotFound' }
+    return 'Unknown'
+}
+
+function Get-ErrorMessage([string]$Category, [string]$OriginalMessage) {
+    switch ($Category) {
+        'Forbidden' { return "YouTube/Vimeo is blocking this video. Try: watching from a different network, using a VPN, or checking if the video is region-locked." }
+        'Timeout' { return "Request timed out. The server may be slow or overloaded. Retrying with increased delay..." }
+        'ConnectionReset' { return "Connection was reset by the server. This often happens with anti-bot measures. Retrying..." }
+        'DNS' { return "Could not resolve the host. Check your internet connection and DNS settings." }
+        'SSL' { return "SSL/TLS error connecting to the server. Your system may need updated root certificates." }
+        'ConnectionFailed' { return "Could not establish connection to the server." }
+        'NotFound' { return "The requested resource was not found. The URL may be invalid or the video was deleted." }
+        'Unknown' { return $OriginalMessage }
+    }
+}
+
+# Circuit breaker state
+$CircuitBreakerOpen = $false
+$CircuitBreakerFailures = 0
+$CircuitBreakerResetSeconds = 30
+
+# Circuit breaker state tracking
+$CircuitBreakerOpen = $false
+$CircuitBreakerFailures = 0
+$CircuitBreakerResetSeconds = 30
+
+# DISABLED: Get-CircuitBreakerState - removed due to PowerShell try/catch syntax issues
+# Use Set-CircuitBreakerOpen and Clear-CircuitBreaker manually instead
+
+function Set-CircuitBreakerOpen([string]$Url) {
+    global $CircuitBreakerOpen, $CircuitBreakerFailures
+
+    $CircuitBreakerOpen = $true
+    $CircuitBreakerFailures++
+    $cbFile = Join-Path $env:TEMP ".mp4claw_cb_${Url.GetHashCode()}"
+    [System.IO.File]::WriteAllText($cbFile, (Get-Date -Format 'O'), [System.Text.Encoding]::UTF8)
+
+    if ($CircuitBreakerFailures -ge 3) {
+        Write-Status "WARNING: Circuit breaker OPEN after $CircuitBreakerFailures consecutive failures. Skipping $Url."
+        Write-Status "  Circuit will reset after $CircuitBreakerResetSeconds seconds."
+    }
+}
+
+function Clear-CircuitBreaker([string]$Url) {
+    global $CircuitBreakerFailures
+    $cbFile = Join-Path $env:TEMP ".mp4claw_cb_${Url.GetHashCode()}"
+    if (Test-Path $cbFile) {
+        Remove-Item $cbFile -Force -ErrorAction SilentlyContinue
+    }
+    $CircuitBreakerFailures = 0
 }
 
 function Invoke-WebText([string]$Url, [hashtable]$ExtraHeaders = @{}) {
@@ -312,7 +372,7 @@ function Get-AdaptiveUrl($VideoStream, $AudioStream) {
             $s = [Convert]::FromBase64String($cipherMap.s)
 
             # Decode the actual URL
-            $decoded = [System.Text.Encoding]::UTF8.GetString($s -bitor $sig)
+            $decoded = [System.Text.Encoding]::UTF8.GetString($s -bor $sig)
             return [uri]::UnescapeDataString($decoded)
         } catch {
             # Fallback: try direct URL from signatureCipher.url
@@ -698,7 +758,27 @@ function Resolve-Video([string]$Link) {
     }
 }
 
-function Get-UrlsToProcess() {
+function Get-UrlsToProcess {
+    # Prioritize command line arguments
+    if ($args.Count -gt 0) {
+        Write-Status "Processing $($args.Count) URL(s) from command line..."
+        # Split on whitespace to handle -ArgumentList format
+        $allArgs = @()
+        $currentArg = $null
+        foreach ($a in $args) {
+            if ($a -match '^--?[^ ]+' -or $a -match '^-') {
+                if ($currentArg) { $allArgs += $currentArg }
+                $currentArg = $a
+            } else {
+                if ($currentArg) { $allArgs += $currentArg + ' ' + $a }
+                $currentArg = $a
+            }
+        }
+        if ($currentArg) { $allArgs += $currentArg }
+        return $allArgs | Where-Object { $_ -and $_ -notmatch '^\s*#' }
+    }
+
+    # Fallback to url.txt file
     $urlFile = Join-Path $Root 'url.txt'
     if (Test-Path -LiteralPath $urlFile) {
         $lines = Get-Content -LiteralPath $urlFile -Encoding UTF8 |
@@ -710,7 +790,7 @@ function Get-UrlsToProcess() {
         }
     }
 
-    Write-Host 'version 1.0.0.0.0.0.0.0.0.005' -ForegroundColor White
+    Write-Host 'version 1.0.1' -ForegroundColor White
     Write-Host 'type out http(s) encrypted link please thanks a lot (paste URL and pressed Enter):' -ForegroundColor Gray
     Write-Host '  just the Tip: or put link(s) in the url.txt in this very folder, one per line or else...' -ForegroundColor DarkGray
     $typed = Read-Host
@@ -758,7 +838,7 @@ function Process-OneUrl([string]$Link) {
 # --- main ---
 try {
     Show-Mp4ClawBanner
-    $urls = Get-UrlsToProcess
+    $urls = Get-UrlsToProcess -Args $args
     foreach ($u in $urls) {
         Write-Status "watching number go up: $u"
         try {
