@@ -762,20 +762,18 @@ function Get-UrlsToProcess {
     # Prioritize command line arguments
     if ($args.Count -gt 0) {
         Write-Status "Processing $($args.Count) URL(s) from command line..."
-        # Split on whitespace to handle -ArgumentList format
-        $allArgs = @()
-        $currentArg = $null
+        # Filter out parameter names, keep only values that look like URLs
+        $urls = @()
         foreach ($a in $args) {
-            if ($a -match '^--?[^ ]+' -or $a -match '^-') {
-                if ($currentArg) { $allArgs += $currentArg }
-                $currentArg = $a
-            } else {
-                if ($currentArg) { $allArgs += $currentArg + ' ' + $a }
-                $currentArg = $a
-            }
+            # Skip parameter names (start with -)
+            if ($a -match '^--?[^ ]+') { continue }
+            # Skip empty or comments
+            if (-not $a -or $a -match '^\s*#') { continue }
+            $urls += $a
         }
-        if ($currentArg) { $allArgs += $currentArg }
-        return $allArgs | Where-Object { $_ -and $_ -notmatch '^\s*#' }
+        if ($urls.Count -gt 0) {
+            return $urls
+        }
     }
 
     # Fallback to url.txt file
