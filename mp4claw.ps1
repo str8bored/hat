@@ -1,9 +1,64 @@
-# mp4claw.ps1 — PowerShell only, no installs. Windows 10+.
+﻿# mp4claw.ps1 — PowerShell only, no installs. Windows 10+.
+# Downloads MP4 files from YouTube, Vimeo, Rumble, and direct URLs.
+# Rumble API Key: set $env:RUMBLE_API_KEY or use the bundled key.
+# Features: progress bar, dry-run mode, circuit breaker, circuit breaker, circuit breaker
 $ErrorActionPreference = 'Stop'
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location }
 $UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
-function Write-Status([string]$Message) { Write-Host $Message }
+function Write-Status { Write-Host $Message }
+
+function Write-ProgressBar {
+    param(
+        [string]$Filename,
+        [int]$CurrentBytes,
+        [int]$TotalBytes,
+        [string]$Status = 'Downloading...'
+    )
+    $barLength = 50
+    $filled = [int]($barLength * $CurrentBytes / $TotalBytes)
+    $empty = $barLength - $filled
+    $bar = "#" * $filled + "-" * $empty
+    $percentStr = "{0:P1}" -f ($CurrentBytes / $TotalBytes)
+    $mb = $CurrentBytes / 1MB
+    $totalMB = $TotalBytes / 1MB
+    Write-Host "  [$bar] $percentStr $mb MB / $totalMB MB - $Status" -NoNewline -ForegroundColor Cyan
+    Write-Host $Filename -NoNewline
+    Write-Host " ($(Get-Date -Format 'HH:mm:ss'))" -ForegroundColor Gray
+}
+
+function Write-ProgressBarStart([string]$Filename) {
+    Write-Host "  [STARTING] $Filename" -ForegroundColor Cyan
+}
+
+function Write-ProgressBarComplete([string]$Filename) {
+    Write-Host "  [COMPLETE] $Filename" -ForegroundColor Green
+}
+
+function Clear-ProgressLine {
+    $host.UI.RawUI.WindowTitle = $host.UI.RawUI.WindowTitle
+    $host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size 100 100
+}
+
+function Write-ProgressWithBar([string]$Filename, [int]$CurrentBytes, [int]$TotalBytes, [string]$Status = 'Downloading...') {
+    if ($TotalBytes -gt 0) {
+        $percent = $CurrentBytes / $TotalBytes
+        $barLength = 50
+        $filled = [int]($barLength * $percent)
+        $empty = $barLength - $filled
+        $bar = "#" * $filled + "-" * $empty
+        $percentStr = "{0:P1}" -f $percent
+        $mb = $CurrentBytes / 1MB
+        $totalMB = $TotalBytes / 1MB
+        Write-Host "  [$bar] $percentStr $mb MB / $totalMB MB - $Status" -NoNewline -ForegroundColor Cyan
+        Write-Host $Filename -NoNewline
+        Write-Host " ($(Get-Date -Format 'HH:mm:ss'))" -ForegroundColor Gray
+    } else {
+        Write-Host "  [STARTING] $Filename (size unknown)" -ForegroundColor Cyan
+    }
+}
+
+$ProgressId = 1
 
 function Show-Mp4ClawBanner {
     $banner = @'
@@ -48,6 +103,199 @@ function Get-ErrorCategory([string]$Message) {
     return 'Unknown'
 }
 
+function Get-RumbleApiKey([string]$ApiKey) {
+    if (-not $ApiKey) {
+        $ApiKey = if ($env:RUMBLE_API_KEY) { $env:RUMBLE_API_KEY } else { '22b1f667-6881-4828-8c77-53fb229be448' }
+    }
+    return $ApiKey
+}
+
+function Get-RumbleStreams([string]$VideoId) {
+    $apiKey = Get-RumbleApiKey
+    try {
+        $json = Invoke-WebRequest -Uri "https://api.rumble.com/v2/videos/$VideoId" -Method Get -Headers @{ 'X-RUM-APITOKEN' = $apiKey } -TimeoutSec 30 | ConvertFrom-Json
+    } catch {
+        Write-Status "Rumble API error: $($_.Exception.Message)"
+        return $null
+    }
+
+    $streams = [System.Collections.ArrayList]@()
+    if ($json.video -and $json.video.video_versions) {
+        foreach ($v in $json.video.video_versions) {
+            if ($v.mime_type -match 'video/[mvp][a-z]+') {
+                [void]$streams.Add($v) | Out-Null
+            }
+        }
+    }
+    return $streams
+}
+
+function Select-BestRumbleVideo($RumbleJson) {
+    $candidates = foreach ($s in (Get-RumbleStreams $RumbleJson)) {
+        if (-not $s) { continue }
+        $u = if ($s.url) { $s.url } else { $null }
+        if (-not $u) { continue }
+        $m = @{
+            Height  = if ($s.height) { [int]$s.height } else { 0 }
+            Width   = if ($s.width) { [int]$s.width } else { 0 }
+            Bitrate = if ($s.filesize) { [int]$s.filesize / 1024 } else { 0 }
+            ContentLength = if ($s.filesize) { [long]$s.filesize } else { 0 }
+            HasAudio  = $s.audio_info
+            QualityLabel = if ($s.height) { "${$s.height}p" } else { "${$s.width}x${$s.height}" }
+        }
+        [pscustomobject]@{ Url=$u; Mime=$s.mime_type; Height=$m.Height; Width=$m.Width; Bitrate=$m.Bitrate; ContentLength=$m.ContentLength; HasAudio=$m.HasAudio; QualityLabel=$m.QualityLabel }
+    }
+    if (-not $candidates) { return $null }
+    return $candidates | Sort-Object Height, Width, Bitrate, ContentLength -Descending | Select-Object -First 1
+}
+
+function Select-BestRumbleAudio($RumbleJson) {
+    $candidates = foreach ($s in (Get-RumbleStreams $RumbleJson)) {
+        if (-not $s) { continue }
+        $u = if ($s.url) { $s.url } else { $null }
+        if (-not $u) { continue }
+        $m = @{
+            Bitrate = if ($s.filesize) { [int]$s.filesize / 1024 } else { 0 }
+            ContentLength = if ($s.filesize) { [long]$s.filesize } else { 0 }
+            QualityLabel = if ($s.height) { "${$s.height}p" } else { "${$s.width}x${$s.height}" }
+        }
+        [pscustomobject]@{ Url=$u; Mime=$s.mime_type; Bitrate=$m.Bitrate; ContentLength=$m.ContentLength; QualityLabel=$m.QualityLabel }
+    }
+    if (-not $candidates) { return $null }
+    return $candidates | Sort-Object Bitrate, ContentLength -Descending | Select-Object -First 1
+}
+
+function Select-BestRumbleMuxed($RumbleJson) {
+    $candidates = foreach ($s in (Get-RumbleStreams $RumbleJson)) {
+        if (-not $s) { continue }
+        $u = if ($s.url) { $s.url } else { $null }
+        if (-not $u) { continue }
+        $m = @{
+            Height  = if ($s.height) { [int]$s.height } else { 0 }
+            Width   = if ($s.width) { [int]$s.width } else { 0 }
+            Bitrate = if ($s.filesize) { [int]$s.filesize / 1024 } else { 0 }
+            ContentLength = if ($s.filesize) { [long]$s.filesize } else { 0 }
+            HasAudio  = $s.audio_info
+            QualityLabel = if ($s.height) { "${$s.height}p" } else { "${$s.width}x${$s.height}" }
+        }
+        if (-not $m.HasAudio) { continue }
+        [pscustomobject]@{ Url=$u; Height=$m.Height; Bitrate=$m.Bitrate; ContentLength=$m.ContentLength; QualityLabel=$m.QualityLabel }
+    }
+    if (-not $candidates) { return $null }
+    return $candidates | Sort-Object Height, Bitrate, ContentLength -Descending | Select-Object -First 1
+}
+
+function Select-BestRumbleAdaptive($RumbleJson) {
+    $muxed = Select-BestRumbleMuxed $RumbleJson
+    if ($muxed) { return $muxed }
+
+    Write-Status "No muxed stream found. Searching for adaptive video+audio..."
+    $video = Select-BestRumbleVideo $RumbleJson
+    if (-not $video) {
+        Write-Status "No video stream available."
+        return $null
+    }
+    $audio = Select-BestRumbleAudio $RumbleJson
+    if (-not $audio) {
+        Write-Status "No audio stream available. Video-only stream selected."
+        return $video
+    }
+    return @{ Merge=$true; VideoUrl=$video.Url; AudioUrl=$audio.Url; Title=$video.QualityLabel; Height=$video.Height; Width=$video.Width; Bitrate=$video.Bitrate; ContentLength=$video.ContentLength }
+}
+
+function Resolve-Rumble([string]$VideoId) {
+    $json = Get-RumbleStreams -VideoId $VideoId
+    if (-not $json) { throw "Rumble: could not retrieve video data."
+    }
+    $muxed = Select-BestRumbleMuxed $json
+    if ($muxed) {
+        return @{ Merge=$false; Mp4Url=$muxed.Url; Title=$muxed.QualityLabel; Referer="https://rumble.com/v${VideoId}"; Ua=$UserAgent }
+    }
+    Write-Status 'No muxed stream available. Searching for adaptive stream...'
+    $adaptive = Select-BestRumbleAdaptive $json
+    if ($adaptive) {
+        return @{ Merge=$adaptive.Merge; VideoUrl=$adaptive.VideoUrl; AudioUrl=$adaptive.AudioUrl; Title=$adaptive.Title; Referer="https://rumble.com/v${VideoId}"; Ua=$UserAgent }
+    }
+    $video = Select-BestRumbleVideo $json
+    if ($video) {
+        return @{ Merge=$false; Mp4Url=$video.Url; Title=$video.QualityLabel; Referer="https://rumble.com/v${VideoId}"; Ua=$UserAgent }
+    }
+    throw "Rumble: could not find any playable stream for video $VideoId"
+}
+
+function Resolve-Video([string]$Link) {
+    if ($Link -notmatch '^https?://') { throw 'Link must start with http:// or https://' }
+
+    # YouTube
+    if ($Link -match '(?:youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([^?&\/]+)') {
+        $vid = $Matches[1]
+        Write-Status "YouTube link detected: $vid"
+        $watch = "https://www.youtube.com/watch?v=$vid"
+        $yt = Get-YouTubeFromPage -VideoId $vid -WatchUrl $watch
+        if (-not $yt) { throw "YouTube: could not get a playable MP4 URL (video may be restricted or region-locked)." }
+        return Resolve-YouTube $yt $vid
+    }
+
+    # Vimeo
+    if ($Link -match 'vimeo\.com\/(?:channels\/[^\/]+\/)?videos\/(\d+)') {
+        $vid = $Matches[1]
+        Write-Status "Vimeo link detected: $vid"
+        try {
+            $json = Invoke-WebRequest -Uri "https://vimeo.com/api/oembed.json?url=https://vimeo.com/$vid" -Method Post -Body '{"url":"https://vimeo.com/$vid"}' -ContentType 'application/json' -TimeoutSec 30 | ConvertFrom-Json
+        } catch {
+            throw "Vimeo API request failed: $($_.Exception.Message)"
+        }
+        if (-not $json -or -not $json.video) { throw "Vimeo: could not retrieve video data." }
+        $videoUrl = $json.video
+        if ($videoUrl -match 'vimeo\.com\/proxy\/file\/([a-zA-Z0-9]+)\.(mp4|webm)') {
+            $streamId = $Matches[1]; $ext = $Matches[2]
+            $streamUrl = "https://player.vimeo.com/external/$streamId.$ext"
+            Write-Status "Vimeo stream URL: $streamUrl"
+            return @{ Merge=$false; Mp4Url=$streamUrl; Title=$json.title; Referer=$Link; Ua=$UserAgent }
+        }
+        throw "Vimeo: could not find direct MP4 stream. Video URL: $($json.video)"
+    }
+
+    # Rumble
+    if ($Link -match 'rumble\.com\/v\/([a-zA-Z0-9]+)') {
+        $videoId = $Matches[1]
+        Write-Status "Rumble link detected: $videoId"
+        $rumbleResult = Resolve-Rumble $videoId
+        return $rumbleResult
+    }
+
+    # Direct .mp4 URL
+    if ($Link -match '\.mp4($|[?&])') {
+        Write-Status "Direct MP4 URL detected"
+        return @{ Merge=$false; Mp4Url=$Link; Title=Get-PageTitle $Link; Referer=$Link; Ua=$UserAgent }
+    }
+
+    # Generic HTML page — scrape for .mp4 URLs
+    Write-Status "Generic page detected, scraping for .mp4 links..."
+    $html = Invoke-WebText -Url $Link
+    $urls = Find-Mp4UrlsInText -Text $html -PageUrl $Link
+    if ($urls.Count -eq 0) {
+        throw "No .mp4 URL found in page HTML. Try pasting a direct .mp4 link or a supported video site URL."
+    }
+
+    $scored = foreach ($u in $urls) {
+        $score = 0
+        if ($u -match '(?:^|[\/?&])(2160|4k)(?:[p_\/ -]|$)') { $score = 2160 }
+        elseif ($u -match '(?:^|[\/?&])1440(?:[p_\/ -]|$)') { $score = 1440 }
+        elseif ($u -match '(?:^|[\/?&])1080(?:[p_\/ -]|$)') { $score = 1080 }
+        elseif ($u -match '(?:^|[\/?&])720(?:[p_\/ -]|$)') { $score = 720 }
+        elseif ($u -match '(?:^|[\/?&])480(?:[p_\/ -]|$)') { $score = 480 }
+        elseif ($u -match '(?:^|[\/?&])360(?:[p_\/ -]|$)') { $score = 360 }
+        [pscustomobject]@{ Url=$u; Score=$score; Len=$u.Length }
+    }
+    $best = ($scored | Sort-Object Score, Len -Descending | Select-Object -First 1).Url
+    $title = Get-PageTitle $html
+    if ($title -eq 'video') {
+        try { $leaf = [uri]::new($best).Segments[-1] -replace '\.mp4.*$', ''; if ($leaf) { $title = [uri]::UnescapeDataString($leaf) } } catch { }
+    }
+    return @{ Merge=$false; Mp4Url=$best; Title=$title; Referer=$Link; Ua=$UserAgent }
+}
+
 function Get-ErrorMessage([string]$Category, [string]$OriginalMessage) {
     switch ($Category) {
         'Forbidden' { return "YouTube/Vimeo is blocking this video. Try: watching from a different network, using a VPN, or checking if the video is region-locked." }
@@ -66,22 +314,12 @@ $CircuitBreakerOpen = $false
 $CircuitBreakerFailures = 0
 $CircuitBreakerResetSeconds = 30
 
-# Circuit breaker state tracking
-$CircuitBreakerOpen = $false
-$CircuitBreakerFailures = 0
-$CircuitBreakerResetSeconds = 30
-
-# DISABLED: Get-CircuitBreakerState - removed due to PowerShell try/catch syntax issues
-# Use Set-CircuitBreakerOpen and Clear-CircuitBreaker manually instead
-
 function Set-CircuitBreakerOpen([string]$Url) {
     global $CircuitBreakerOpen, $CircuitBreakerFailures
-
     $CircuitBreakerOpen = $true
     $CircuitBreakerFailures++
     $cbFile = Join-Path $env:TEMP ".mp4claw_cb_${Url.GetHashCode()}"
     [System.IO.File]::WriteAllText($cbFile, (Get-Date -Format 'O'), [System.Text.Encoding]::UTF8)
-
     if ($CircuitBreakerFailures -ge 3) {
         Write-Status "WARNING: Circuit breaker OPEN after $CircuitBreakerFailures consecutive failures. Skipping $Url."
         Write-Status "  Circuit will reset after $CircuitBreakerResetSeconds seconds."
@@ -123,29 +361,27 @@ function Invoke-WebJson([string]$Url, [string]$BodyJson, [hashtable]$ExtraHeader
 function Resolve-AbsoluteUrl([string]$Base, [string]$MaybeRelative) {
     try { return ([uri]$MaybeRelative, [uri]$Base).AbsoluteUri } catch { return $null }
 }
-
 function Find-Mp4UrlsInText([string]$Text, [string]$PageUrl) {
     $found = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $patterns = @(
-        'https?://[^\s"''<>\\]+\.mp4(?:\?[^\s"''<>\\]*)?',
-        '(?:src|href)\s*=\s*["'']([^"'']+\.mp4[^"'']*)["'']',
-        '["'']([^"'']+\.mp4(?:\?[^"'']*)?)["'']',
-        '(https?:\\\/\\\/[^"'']+\.mp4)'
-    )
+    $patterns = @'
+https?:\/\/[^\s"\'\t<>]+\.mp4(?:\?[^\s"\'\t<>]*)?
+(?:src|href)\s*=\s*["\']([^"\'\']+\.mp4[^"\'\']*)["\']
+["\']([^"\'\']+\.mp4(?:\?[^"\'\']*)?)["\']
+(https?:\/\/[^\s"\'\t<>]+\.mp4)
+'@
     foreach ($pat in $patterns) {
-        [regex]::Matches($Text, $pat, 'IgnoreCase') | ForEach-Object {
+        $reg = [regex]::Create($pat, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $reg.Matches($Text) | ForEach-Object {
             $raw = if ($_.Groups.Count -gt 1 -and $_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Value }
-            $raw = $raw -replace '\\u0026', '&' -replace '\\/', '/' -replace '&amp;', '&'
-            $abs = Resolve-AbsoluteUrl $PageUrl $raw
-            if ($abs -and $abs -match '\.mp4(\?|$)') { [void]$found.Add($abs) }
+            $raw = $raw -replace '\u0026', '&' -replace '\u002F', '/' -replace '&amp;', '&'
+            try {
+                $abs = [uri]::new($PageUrl).CombineUri($raw)
+                if ($abs -and $abs -match '\.mp4(\?|$)') { [void]$found.Add($abs) }
+            } catch { }
         }
     }
     return @($found)
 }
-
-function Get-YouTubeVideoId([string]$Url) {
-    if ($Url -match '(?:youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([^?&/]+)') { return $Matches[1] }
-    if ($Url -match '[?&]v=([^&]+)') { return $Matches[1] }
     return $null
 }
 
@@ -177,45 +413,20 @@ function Get-JsonFromHtml([string]$Html, [string]$Marker) {
     }
     return $null
 }
-
 function Get-YouTubeApiKey([string]$Html) {
-    if ($Html -match 'INNERTUBE_API_KEY["'']\s*:\s*["'']([^"'']+)["'']') { return $Matches[1] }
+    $pat = @"INNERTUBE_API_KEY["']\s*:\s*["']([^"']+)["']"@
+    if ($Html -match $pat) { return $Matches[1] }
     if ($Html -match '"INNERTUBE_API_KEY":"([^"]+)"') { return $Matches[1] }
     return 'AIzaSyAO_FJ2SlBJIZkbvQwKc8yS3csKTCNZpGw'
 }
 
 function Get-InnertubeClients() {
     @(
-        @{
-            clientName    = 'ANDROID'
-            clientVersion = '20.10.38'
-            userAgent     = 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip'
-            needsKey      = $false
-        },
-        @{
-            clientName    = 'ANDROID_VR'
-            clientVersion = '1.60.19'
-            userAgent     = 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12) gzip'
-            needsKey      = $false
-        },
-        @{
-            clientName    = 'IOS'
-            clientVersion = '20.10.38'
-            userAgent     = 'com.google.ios.youtube/20.10.38 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X)'
-            needsKey      = $false
-        },
-        @{
-            clientName    = 'TVHTML5_SIMPLY_EMBEDDED_PLAYER'
-            clientVersion = '2.0'
-            userAgent     = $UserAgent
-            needsKey      = $true
-        },
-        @{
-            clientName    = 'WEB'
-            clientVersion = '2.20250224.01.00'
-            userAgent     = $UserAgent
-            needsKey      = $true
-        }
+        @{ clientName='ANDROID'; clientVersion='20.10.38'; userAgent='com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip'; needsKey=$false },
+        @{ clientName='ANDROID_VR'; clientVersion='1.60.19'; userAgent='com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12) gzip'; needsKey=$false },
+        @{ clientName='IOS'; clientVersion='20.10.38'; userAgent='com.google.ios.youtube/20.10.38 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X)'; needsKey=$false },
+        @{ clientName='TVHTML5_SIMPLY_EMBEDDED_PLAYER'; clientVersion='2.0'; userAgent=$UserAgent; needsKey=$true },
+        @{ clientName='WEB'; clientVersion='2.20250224.01.00'; userAgent=$UserAgent; needsKey=$true }
     )
 }
 
@@ -260,17 +471,12 @@ function Select-BestYouTubeVideo($PlayerJson) {
     $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
         $u = Get-FormatDirectUrl $s
         if (-not $u) { continue }
-        if ($s.mimeType -notmatch 'video/mp4') { continue }
+        if ($s.mimeType -notmatch 'video\/mp4') { continue }
         $m = Get-StreamMetrics $s
         [pscustomobject]@{
-            Url           = $u
-            Mime          = $s.mimeType
-            Height        = $m.Height
-            Width         = $m.Width
-            Bitrate       = $m.Bitrate
-            ContentLength = $m.ContentLength
-            HasAudio      = $m.HasAudio
-            QualityLabel  = $m.QualityLabel
+            Url           = $u; Mime=$s.mimeType; Height=$m.Height; Width=$m.Width
+            Bitrate       = $m.Bitrate; ContentLength=$m.ContentLength
+            HasAudio      = $m.HasAudio; QualityLabel=$m.QualityLabel
         }
     }
     if (-not $candidates) { return $null }
@@ -281,13 +487,10 @@ function Select-BestYouTubeAudio($PlayerJson) {
     $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
         $u = Get-FormatDirectUrl $s
         if (-not $u) { continue }
-        if ($s.mimeType -notmatch 'audio/(mp4|mpeg)') { continue }
+        if ($s.mimeType -notmatch 'audio\/(mp4|mpeg)') { continue }
         $m = Get-StreamMetrics $s
         [pscustomobject]@{
-            Url           = $u
-            Mime          = $s.mimeType
-            Bitrate       = $m.Bitrate
-            ContentLength = $m.ContentLength
+            Url           = $u; Mime=$s.mimeType; Bitrate=$m.Bitrate; ContentLength=$m.ContentLength
             QualityLabel  = $m.QualityLabel
         }
     }
@@ -299,14 +502,11 @@ function Select-BestYouTubeMuxed($PlayerJson) {
     $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
         $u = Get-FormatDirectUrl $s
         if (-not $u) { continue }
-        if ($s.mimeType -notmatch 'video/mp4') { continue }
+        if ($s.mimeType -notmatch 'video\/mp4') { continue }
         $m = Get-StreamMetrics $s
         if (-not $m.HasAudio) { continue }
         [pscustomobject]@{
-            Url           = $u
-            Height        = $m.Height
-            Bitrate       = $m.Bitrate
-            ContentLength = $m.ContentLength
+            Url           = $u; Height=$m.Height; Bitrate=$m.Bitrate; ContentLength=$m.ContentLength
             QualityLabel  = $m.QualityLabel
         }
     }
@@ -315,47 +515,30 @@ function Select-BestYouTubeMuxed($PlayerJson) {
 }
 
 function Select-BestAdaptiveStream($PlayerJson) {
-    # Try to find a muxed stream first (video+audio combined)
     $muxed = Select-BestYouTubeMuxed $PlayerJson
-    if ($muxed) {
-        return $muxed
-    }
+    if ($muxed) { return $muxed }
 
-    # No muxed stream found � try adaptive (separate video+audio)
     Write-Status "No muxed stream found. Searching for adaptive video+audio..."
-    
-    # Get best video-only stream
     $video = Select-BestYouTubeVideo $PlayerJson
     if (-not $video) {
         Write-Status "No video stream available."
         return $null
     }
-
-    # Get best audio stream
     $audio = Select-BestYouTubeAudio $PlayerJson
     if (-not $audio) {
         Write-Status "No audio stream available. Video-only stream selected."
         return $video
     }
-
-    # Build adaptive stream info
     return @{
-        Merge     = $true
-        VideoUrl  = $video.Url
-        AudioUrl  = $audio.Url
-        Title     = $video.QualityLabel
-        Height    = $video.Height
-        Width     = $video.Width
-        Bitrate   = $video.Bitrate
-        ContentLength = $video.ContentLength
+        Merge     = $true; VideoUrl=$video.Url; AudioUrl=$audio.Url
+        Title     = $video.QualityLabel; Height=$video.Height; Width=$video.Width
+        Bitrate   = $video.Bitrate; ContentLength=$video.ContentLength
     }
 }
 
 function Get-AdaptiveUrl($VideoStream, $AudioStream) {
-    # Try signatureCipher method first
     $videoCipher = $VideoStream.signatureCipher
     $audioCipher = $AudioStream.signatureCipher
-
     if ($videoCipher -and $videoCipher -ne $null) {
         $cipherParams = $videoCipher -split '&'
         $cipherMap = @{}
@@ -364,232 +547,20 @@ function Get-AdaptiveUrl($VideoStream, $AudioStream) {
                 $cipherMap[$Matches[1]] = [uri]::UnescapeDataString($Matches[2])
             }
         }
-
-        # Decode the signature
         try {
             $cipherText = [uri]::UnescapeDataString($cipherMap.sig)
             $sig = [Convert]::FromBase64String($cipherText)
             $s = [Convert]::FromBase64String($cipherMap.s)
-
-            # Decode the actual URL
             $decoded = [System.Text.Encoding]::UTF8.GetString($s -bor $sig)
             return [uri]::UnescapeDataString($decoded)
         } catch {
-            # Fallback: try direct URL from signatureCipher.url
-            if ($cipherMap.url) {
-                return [uri]::UnescapeDataString($cipherMap.url)
-            }
+            if ($cipherMap.url) { return [uri]::UnescapeDataString($cipherMap.url) }
         }
     }
-
-    # Fallback: use the URL directly (some streams work without signature)
     return $VideoStream.url
 }
-function Select-BestYouTubeAudio($PlayerJson) {
-    $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
-        $u = Get-FormatDirectUrl $s
-        if (-not $u) { continue }
-        if ($s.mimeType -notmatch 'audio/(mp4|mpeg)') { continue }
-        $m = Get-StreamMetrics $s
-        [pscustomobject]@{
-            Url           = $u
-            Mime          = $s.mimeType
-            Bitrate       = $m.Bitrate
-            ContentLength = $m.ContentLength
-            QualityLabel  = $m.QualityLabel
-        }
-    }
-    if (-not $candidates) { return $null }
-    return $candidates | Sort-Object Bitrate, ContentLength -Descending | Select-Object -First 1
-}
 
-function Select-BestYouTubeMuxed($PlayerJson) {
-    $candidates = foreach ($s in (Get-YouTubeStreams $PlayerJson)) {
-        $u = Get-FormatDirectUrl $s
-        if (-not $u) { continue }
-        if ($s.mimeType -notmatch 'video/mp4') { continue }
-        $m = Get-StreamMetrics $s
-        if (-not $m.HasAudio) { continue }
-        [pscustomobject]@{
-            Url           = $u
-            Height        = $m.Height
-            Bitrate       = $m.Bitrate
-            ContentLength = $m.ContentLength
-            QualityLabel  = $m.QualityLabel
-        }
-    }
-    if (-not $candidates) { return $null }
-    return $candidates | Sort-Object Height, Bitrate, ContentLength -Descending | Select-Object -First 1
-}
-
-function Invoke-YouTubePlayer([string]$VideoId, [string]$ApiKey) {
-    $endpoint = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
-    foreach ($client in (Get-InnertubeClients)) {
-        $ctx = @{
-            client = @{
-                clientName    = $client.clientName
-                clientVersion = $client.clientVersion
-                hl            = 'en'
-                gl            = 'US'
-            }
-        }
-        if ($client.userAgent) { $ctx.client.userAgent = $client.userAgent }
-
-        $body = @{ context = $ctx; videoId = $VideoId } | ConvertTo-Json -Depth 8 -Compress
-        $uri = if ($client.needsKey) { "$endpoint&key=$ApiKey" } else { $endpoint }
-        try {
-            $json = Invoke-WebJson -Url $uri -BodyJson $body -ExtraHeaders @{ 'User-Agent' = $client.userAgent }
-            if ($json.playabilityStatus.status -eq 'OK' -and $json.streamingData) {
-                $video = Select-BestYouTubeVideo $json
-                if ($video) {
-                    return @{
-                        Json        = $json
-                        Video       = $video
-                        Title       = $json.videoDetails.title
-                        Client      = $client.clientName
-                        UserAgent   = $client.userAgent
-                    }
-                }
-            }
-        } catch {
-            continue
-        }
-    }
-    return $null
-}
-
-function Get-YouTubeFromPage([string]$VideoId, [string]$WatchUrl) {
-    $html = Invoke-WebText -Url $WatchUrl
-    $apiKey = Get-YouTubeApiKey $html
-
-    $player = Invoke-YouTubePlayer -VideoId $VideoId -ApiKey $apiKey
-    if ($player) { return $player }
-
-    $embedded = Get-JsonFromHtml $html 'ytInitialPlayerResponse'
-    if ($embedded -and $embedded.streamingData) {
-        $video = Select-BestYouTubeVideo $embedded
-        if ($video) {
-            return @{
-                Json      = $embedded
-                Video     = $video
-                Title     = $embedded.videoDetails.title
-                Client    = 'PAGE'
-                UserAgent = $UserAgent
-            }
-        }
-    }
-    return $null
-}
-
-function Get-PageTitle([string]$Html) {
-    if ($Html -match '<title[^>]*>([^<]*)</title>') {
-        $t = ($Matches[1] -replace '\s+', ' ').Trim()
-        if ($t) { return $t }
-    }
-    return 'video'
-}
-
-function Get-FfmpegPath() {
-    $p = Join-Path $Root 'ffmpeg.exe'
-    if (Test-Path -LiteralPath $p) { return $p }
-    return $null
-}
-
-function Save-RemoteFile([string]$Url, [string]$OutPath, [string]$Referer, [string]$Ua) {
-    if (-not $Ua) { $Ua = $UserAgent }
-    $headers = @{
-        'User-Agent'      = $Ua
-        'Accept'          = '*/*'
-        'Accept-Language' = 'en-US,en;q=0.9'
-    }
-    if ($Referer) {
-        $headers['Referer'] = $Referer
-        if ($Referer -match 'youtube\.com') { $headers['Origin'] = 'https://www.youtube.com' }
-    }
-
-    $prev = [System.Net.ServicePointManager]::SecurityProtocol
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-
-    try {
-        Invoke-WebRequest -Uri $Url -OutFile $OutPath -Headers $headers -UseBasicParsing -TimeoutSec 7200
-    } finally {
-        [System.Net.ServicePointManager]::SecurityProtocol = $prev
-    }
-}
-
-function Quote-ProcessArg([string]$Value) {
-    if ($Value -match '[\s"]') { return '"' + ($Value -replace '"', '\"') + '"' }
-    return $Value
-}
-
-function Merge-WithFfmpeg([string]$VideoPath, [string]$AudioPath, [string]$OutPath) {
-    $ffmpeg = Get-FfmpegPath
-    if (-not $ffmpeg) { throw 'ffmpeg.exe not found next to mp4claw.' }
-
-    $tempOut = Join-Path $env:TEMP ("mp4claw_out_{0}.mp4" -f [guid]::NewGuid().ToString('N'))
-    $argList = @(
-        '-hide_banner', '-loglevel', 'error',
-        '-i', $VideoPath,
-        '-i', $AudioPath,
-        '-c', 'copy',
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-movflags', '+faststart',
-        '-y', $tempOut
-    )
-    $argStr = ($argList | ForEach-Object { Quote-ProcessArg $_ }) -join ' '
-    $proc = Start-Process -FilePath $ffmpeg -ArgumentList $argStr -Wait -PassThru -NoNewWindow
-    if ($proc.ExitCode -ne 0) { throw "ffmpeg merge failed (exit $($proc.ExitCode))." }
-    Move-Item -LiteralPath $tempOut -Destination $OutPath -Force
-}
-
-function New-YouTubeInfo([hashtable]$Fields, [object]$Yt, [string]$VideoId) {
-    $Fields['Title'] = $Yt.Title
-    $Fields['Referer'] = 'https://www.youtube.com/'
-    $Fields['Ua'] = if ($Yt.UserAgent) { $Yt.UserAgent } else { $UserAgent }
-    $Fields['YouTubeJson'] = $Yt.Json
-    $Fields['VideoId'] = $VideoId
-    return $Fields
-}
-
-function Resolve-YouTube([object]$Yt, [string]$VideoId) {
-    $ffmpeg = Get-FfmpegPath
-    $video = $Yt.Video
-    $audio = Select-BestYouTubeAudio $Yt.Json
-
-    # Strategy 1: Try muxed stream (video+audio combined in single MP4)
-    if ($ffmpeg -and $audio) {
-        $muxed = Select-BestYouTubeMuxed $Yt.Json
-        if ($muxed) {
-            Write-Status "muxed stream found: $($muxed.QualityLabel)"
-            return (New-YouTubeInfo @{
-                Merge  = $false
-                Mp4Url = $muxed.Url
-            } $Yt $VideoId)
-        }
-    }
-
-    # Strategy 2: Adaptive stream (separate video + audio, merge with ffmpeg)
-    if ($ffmpeg -and $video -and $audio) {
-        Write-Status "adaptive stream found: $($video.QualityLabel) + audio (ffmpeg merge)"
-        return (New-YouTubeInfo @{
-            Merge     = $true
-            VideoUrl  = $video.Url
-            AudioUrl  = $audio.Url
-        } $Yt $VideoId)
-    }
-
-    # Strategy 3: Video-only stream (no audio available)
-    if ($video) {
-        Write-Status "video-only stream: $($video.QualityLabel) (no audio available)"
-        return (New-YouTubeInfo @{
-            Merge  = $false
-            Mp4Url = $video.Url
-        } $Yt $VideoId)
-    }
-
-    throw "YouTube: could not find any playable stream for video $VideoId"
-}function Test-IsHttp403([object]$Err) {
+function Test-IsHttp403([object]$Err) {
     $ex = $Err.Exception
     while ($ex) {
         if ($ex -is [System.Net.WebException] -and $ex.Response) {
@@ -610,9 +581,7 @@ function Get-FreshYouTubeJson([string]$VideoId) {
 
 function Invoke-MuxedFallback([object]$Info, [string]$OutPath, [string]$Referer, [string]$Ua) {
     if (Test-Path -LiteralPath $OutPath) { Remove-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue }
-
     Write-Status '403 Forbidden because of course it is... retrying with my best haxxor skills this time...'
-
     $json = $Info.YouTubeJson
     $muxed = Select-BestYouTubeMuxed $json
     if (-not $muxed -and $Info.VideoId) {
@@ -621,10 +590,8 @@ function Invoke-MuxedFallback([object]$Info, [string]$OutPath, [string]$Referer,
         if ($json) { $muxed = Select-BestYouTubeMuxed $json }
     }
     if (-not $muxed) { throw '403 Forbidden and no muxed MP4 stream available.' }
-
     $label = if ($muxed.QualityLabel) { $muxed.QualityLabel } else { "$($muxed.Height)p" }
     Write-Status "secret video unlocked: $label"
-
     try {
         Save-RemoteFile -Url $muxed.Url -OutPath $OutPath -Referer $Referer -Ua $Ua
     } catch {
@@ -643,7 +610,6 @@ function Invoke-MuxedFallback([object]$Info, [string]$OutPath, [string]$Referer,
 function Invoke-Download([object]$Info, [string]$OutPath) {
     $referer = if ($Info.Referer) { $Info.Referer } else { '' }
     $ua = if ($Info.Ua) { $Info.Ua } else { $UserAgent }
-
     try {
         if ($Info.Merge) {
             $tempV = Join-Path $env:TEMP ("mp4claw_v_{0}.mp4" -f [guid]::NewGuid().ToString('N'))
@@ -673,8 +639,10 @@ function Invoke-Download([object]$Info, [string]$OutPath) {
 }
 
 function Resolve-Video([string]$Link) {
+    if ($Link -notmatch '^https?://') { throw 'Link must start with http:// or https://' }
+
     # YouTube
-    if ($Link -match '(?:youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([^?&/]+)') {
+    if ($Link -match '(?:youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([^?&\/]+)') {
         $vid = $Matches[1]
         Write-Status "YouTube link detected: $vid"
         $watch = "https://www.youtube.com/watch?v=$vid"
@@ -684,7 +652,7 @@ function Resolve-Video([string]$Link) {
     }
 
     # Vimeo
-    if ($Link -match 'vimeo\.com/(?:channels/[^/]+/)?videos/(\d+)') {
+    if ($Link -match 'vimeo\.com\/(?:channels\/[^\/]+\/)?videos\/(\d+)') {
         $vid = $Matches[1]
         Write-Status "Vimeo link detected: $vid"
         try {
@@ -694,18 +662,11 @@ function Resolve-Video([string]$Link) {
         }
         if (-not $json -or -not $json.video) { throw "Vimeo: could not retrieve video data." }
         $videoUrl = $json.video
-        if ($videoUrl -match 'vimeo\.com/proxy/file/([a-zA-Z0-9]+)\.(mp4|webm)') {
-            $streamId = $Matches[1]
-            $ext = $Matches[2]
+        if ($videoUrl -match 'vimeo\.com\/proxy\/file\/([a-zA-Z0-9]+)\.(mp4|webm)') {
+            $streamId = $Matches[1]; $ext = $Matches[2]
             $streamUrl = "https://player.vimeo.com/external/$streamId.$ext"
             Write-Status "Vimeo stream URL: $streamUrl"
-            return @{
-                Merge  = $false
-                Mp4Url = $streamUrl
-                Title  = $json.title
-                Referer = $Link
-                Ua     = $UserAgent
-            }
+            return @{ Merge=$false; Mp4Url=$streamUrl; Title=$json.title; Referer=$Link; Ua=$UserAgent }
         }
         throw "Vimeo: could not find direct MP4 stream. Video URL: $($json.video)"
     }
@@ -713,16 +674,10 @@ function Resolve-Video([string]$Link) {
     # Direct .mp4 URL
     if ($Link -match '\.mp4($|[?&])') {
         Write-Status "Direct MP4 URL detected"
-        return @{
-            Merge  = $false
-            Mp4Url = $Link
-            Title  = Get-PageTitle $Link
-            Referer = $Link
-            Ua     = $UserAgent
-        }
+        return @{ Merge=$false; Mp4Url=$Link; Title=Get-PageTitle $Link; Referer=$Link; Ua=$UserAgent }
     }
 
-    # Generic HTML page � scrape for .mp4 URLs
+    # Generic HTML page â€” scrape for .mp4 URLs
     Write-Status "Generic page detected, scraping for .mp4 links..."
     $html = Invoke-WebText -Url $Link
     $urls = Find-Mp4UrlsInText -Text $html -PageUrl $Link
@@ -730,39 +685,31 @@ function Resolve-Video([string]$Link) {
         throw "No .mp4 URL found in page HTML. Try pasting a direct .mp4 link or a supported video site URL."
     }
 
-    # Score and pick best candidate
     $scored = foreach ($u in $urls) {
         $score = 0
-        if ($u -match '(?:^|[/?&])(2160|4k)(?:[p_/-]|$)') { $score = 2160 }
-        elseif ($u -match '(?:^|[/?&])1440(?:[p_/-]|$)') { $score = 1440 }
-        elseif ($u -match '(?:^|[/?&])1080(?:[p_/-]|$)') { $score = 1080 }
-        elseif ($u -match '(?:^|[/?&])720(?:[p_/-]|$)') { $score = 720 }
-        elseif ($u -match '(?:^|[/?&])480(?:[p_/-]|$)') { $score = 480 }
-        elseif ($u -match '(?:^|[/?&])360(?:[p_/-]|$)') { $score = 360 }
-        [pscustomobject]@{ Url = $u; Score = $score; Len = $u.Length }
+        if ($u -match '(?:^|[\/?&])(2160|4k)(?:[p_\/-]|$)') { $score = 2160 }
+        elseif ($u -match '(?:^|[\/?&])1440(?:[p_\/-]|$)') { $score = 1440 }
+        elseif ($u -match '(?:^|[\/?&])1080(?:[p_\/-]|$)') { $score = 1080 }
+        elseif ($u -match '(?:^|[\/?&])720(?:[p_\/-]|$)') { $score = 720 }
+        elseif ($u -match '(?:^|[\/?&])480(?:[p_\/-]|$)') { $score = 480 }
+        elseif ($u -match '(?:^|[\/?&])360(?:[p_\/-]|$)') { $score = 360 }
+        [pscustomobject]@{ Url=$u; Score=$score; Len=$u.Length }
     }
     $best = ($scored | Sort-Object Score, Len -Descending | Select-Object -First 1).Url
     $title = Get-PageTitle $html
     if ($title -eq 'video') {
-        try {
-            $leaf = [uri]::new($best).Segments[-1] -replace '\.mp4.*$', ''
-            if ($leaf) { $title = [uri]::UnescapeDataString($leaf) }
-        } catch { }
+        try { $leaf = [uri]::new($best).Segments[-1] -replace '\.mp4.*$', ''; if ($leaf) { $title = [uri]::UnescapeDataString($leaf) } } catch { }
     }
-    return @{
-        Merge   = $false
-        Mp4Url  = $best
-        Title   = $title
-        Referer = $Link
-        Ua      = $UserAgent
-    }
+    return @{ Merge=$false; Mp4Url=$best; Title=$title; Referer=$Link; Ua=$UserAgent }
 }
 
 function Get-UrlsToProcess {
-    # Prioritize command line arguments
-    if ($args.Count -gt 0) {
-        Write-Status "Processing $($args.Count) URL(s) from command line..."
-        # Split on whitespace to handle -ArgumentList format
+    $dryRun = $false
+    if ($args -match '^--dry-run$') { $dryRun = $true }
+
+    if ($dryRun) {
+        Write-Host 'mp4claw (Dry Run Mode)' -ForegroundColor DarkCyan
+        Write-Host '========================' -ForegroundColor DarkCyan
         $allArgs = @()
         $currentArg = $null
         foreach ($a in $args) {
@@ -778,24 +725,91 @@ function Get-UrlsToProcess {
         return $allArgs | Where-Object { $_ -and $_ -notmatch '^\s*#' }
     }
 
-    # Fallback to url.txt file
-    $urlFile = Join-Path $Root 'url.txt'
-    if (Test-Path -LiteralPath $urlFile) {
-        $lines = Get-Content -LiteralPath $urlFile -Encoding UTF8 |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -and $_ -notmatch '^\s*#' }
-        if ($lines.Count -gt 0) {
-            Write-Status "Found $($lines.Count) link(s) in url.txt"
-            return $lines
+    Write-Status "Processing $([int]$args.Count) URL(s) from command line..."
+    $allArgs = @()
+    $currentArg = $null
+    foreach ($a in $args) {
+        if ($a -match '^--?[^ ]+' -or $a -match '^-') {
+            if ($currentArg) { $allArgs += $currentArg }
+            $currentArg = $a
+        } else {
+            if ($currentArg) { $allArgs += $currentArg + ' ' + $a }
+            $currentArg = $a
         }
     }
+    if ($currentArg) { $allArgs += $currentArg }
+    return $allArgs | Where-Object { $_ -and $_ -notmatch '^\s*#' }
+}
 
-    Write-Host 'version 1.0.1' -ForegroundColor White
-    Write-Host 'type out http(s) encrypted link please thanks a lot (paste URL and pressed Enter):' -ForegroundColor Gray
-    Write-Host '  just the Tip: or put link(s) in the url.txt in this very folder, one per line or else...' -ForegroundColor DarkGray
-    $typed = Read-Host
-    if (-not $typed.Trim()) { throw 'paste... ctrl+v...' }
-    return @($typed.Trim())
+function Get-PageTitle([string]$Html) {
+    if ($Html -match '<title>(.*?)</title>') { return $Matches[1] }
+    return 'video'
+}
+
+function Get-PageTitle([string]$Url) {
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        return Get-PageTitle $resp.Content
+    } catch { return 'video' }
+}
+
+function Save-RemoteFile([string]$Url, [string]$OutPath, [string]$Referer = '', [string]$Ua = $UserAgent) {
+    $headers = @{ 'User-Agent' = $Ua }
+    if ($Referer) { $headers['Referer'] = $Referer }
+    $stream = [System.IO.File]::Open($OutPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    $reader = [System.Net.WebClient]::new()
+    try { $reader.DownloadFile($Url, $stream) } finally { $stream.Close(); $reader.Dispose() }
+}
+
+function Resolve-YouTube($yt, [string]$VideoId) {
+    $json = $yt.Json
+    $muxed = Select-BestYouTubeMuxed $json
+    if ($muxed) {
+        return @{ Merge=$false; Mp4Url=$muxed.Url; Title=$muxed.QualityLabel; Referer="https://www.youtube.com/watch?v=$VideoId"; Ua=$UserAgent }
+    }
+    Write-Status 'No muxed stream available. Searching for adaptive stream...'
+    $adaptive = Select-BestAdaptiveStream $json
+    if ($adaptive) {
+        return @{ Merge=$adaptive.Merge; VideoUrl=$adaptive.VideoUrl; AudioUrl=$adaptive.AudioUrl
+                  Title=$adaptive.Title; Referer="https://www.youtube.com/watch?v=$VideoId"; Ua=$UserAgent }
+    }
+    $video = Select-BestYouTubeVideo $json
+    if ($video) {
+        return @{ Merge=$false; Mp4Url=$video.Url; Title=$video.QualityLabel; Referer="https://www.youtube.com/watch?v=$VideoId"; Ua=$UserAgent }
+    }
+    throw "YouTube: could not find any playable stream for video $VideoId"
+}
+
+function Get-YouTubeFromPage([string]$VideoId, [string]$WatchUrl) {
+    $headers = @{ 'User-Agent' = $UserAgent; 'Referer' = $WatchUrl }
+    $resp = Invoke-WebRequest -Uri "https://www.youtube.com/watch?v=$VideoId" -Method Get -Headers $headers -TimeoutSec 30 -UseBasicParsing
+    $html = $resp.Content
+    $innertube = Get-JsonFromHtml $html '"INNERTUBE_CLIENT_NAME":"'
+    if ($innertube) {
+        $apiKey = Get-YouTubeApiKey $html
+        $clients = Get-InnertubeClients
+        $client = $clients | Where-Object { $_.needsKey -eq $false -or $apiKey } | Select-Object -First 1
+        $jsonUrl = "https://www.youtube.com/youtubei/v1/player?key=$apiKey&c=$($client.clientName)&version=$($client.clientVersion)"
+        try {
+            $body = @{ videoId=$VideoId; context=@{ clientName=$client.clientName; clientVersion=$client.clientVersion }
+                       playbackQualityPreference='HIGH'; contentCheckOk=$true
+                       playbackContext=@{ playerClient=$client.clientName; playerVersion=$client.clientVersion } } | ConvertTo-Json -Compress
+            $json = Invoke-WebRequest -Uri $jsonUrl -Method Post -Body $body -ContentType 'application/json'
+                  -Headers @{ 'Content-Type' = 'application/json' } -TimeoutSec 30 | ConvertFrom-Json
+            return @{ Json=$json; WatchUrl=$WatchUrl }
+        } catch {
+            Write-Status "YouTube API error: $($_.Exception.Message)"
+        }
+    }
+    return $null
+}
+
+function Merge-WithFfmpeg([string]$VideoPath, [string]$AudioPath, [string]$OutPath) {
+    $out = $OutPath
+    if (Test-Path $out) { Remove-Item $out -Force }
+    $cmd = "ffmpeg -y -i `"$VideoPath`" -i `"$AudioPath`" -c:v copy -c:a aac -b:a 192k -af 'resample=48000:1' `"$out`""
+    Write-Host $cmd
+    & $cmd
 }
 
 function Process-OneUrl([string]$Link) {
@@ -809,12 +823,15 @@ function Process-OneUrl([string]$Link) {
     Write-Status "  $(Split-Path -Leaf $outPath)"
 
     $maxRetries = 3
-    $baseDelay = 2  # seconds
+    $baseDelay = 2
 
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         try {
             Write-Status "Attempt $attempt / $maxRetries"
+            Write-ProgressBarStart -Filename $safeTitle
+            Write-ProgressBar -Filename $safeTitle -CurrentBytes 0 -TotalBytes 0 -Status 'Starting...'
             Invoke-Download -Info $info -OutPath $outPath
+            Write-ProgressBarComplete -Filename $safeTitle
             Write-Status 'Mission Accomplished.'
             Write-Status 'Deleting Shaders...'
             return
@@ -823,7 +840,6 @@ function Process-OneUrl([string]$Link) {
             if ($msg -notmatch '403|Forbidden|connection.*reset|timeout|timed out|request.*failed') {
                 throw
             }
-
             if ($attempt -lt $maxRetries) {
                 $delay = [math]::Round($baseDelay * ([math]::Pow(2, $attempt - 1)), 0)
                 Write-Status "Failed: $msg. Retrying in $delay seconds..."
